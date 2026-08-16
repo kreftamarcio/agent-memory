@@ -6,44 +6,55 @@
  *   semantic   -> what is true    (subject-predicate-object facts, confidence-scored)
  *   procedural -> how to do it    (versioned procedures with success tracking)
  *
- * The stores are independent and usable on their own. MemoryManager exists
- * because most agents need all three at once and should not have to fan out
- * three queries and merge the results by hand on every turn.
+ * The stores are independent and usable on their own. MemoryManager exists because
+ * most agents need all three at once and should not have to fan out three queries and
+ * merge the results by hand on every turn.
+ *
+ * Relative imports carry explicit .js extensions because moduleResolution is NodeNext,
+ * which requires them. Omitting them is a compile error, not a style choice.
  */
 
-import { EpisodicStore } from './stores/episodic.store';
-import { SemanticStore } from './stores/semantic.store';
-import { ProceduralStore } from './stores/procedural.store';
-import { DecayEngine } from './scoring/decay';
+import { EpisodicStore } from './stores/episodic.store.js';
+import { SemanticStore } from './stores/semantic.store.js';
+import { ProceduralStore } from './stores/procedural.store.js';
+import { DecayEngine } from './scoring/decay.js';
+import { RetrievalRanker } from './scoring/ranking.js';
 
 import type {
   Episode,
   EpisodeContext,
   EpisodicQuery,
   EpisodicStoreConfig,
-} from './stores/episodic.store';
+} from './stores/episodic.store.js';
 import type {
   Fact,
   FactSource,
   SemanticQuery,
   SemanticStoreConfig,
   ContradictionReport,
-} from './stores/semantic.store';
+} from './stores/semantic.store.js';
 import type {
   Procedure,
   ProcedureStep,
   ProcedurePerformance,
   ProceduralQuery,
   ProceduralStoreConfig,
-} from './stores/procedural.store';
+} from './stores/procedural.store.js';
 import type {
   DecayProfile,
   DecayConfig,
   MemoryTrace,
   MemoryStore as MemoryStoreKind,
-} from './scoring/decay';
+} from './scoring/decay.js';
+import type {
+  RankingWeights,
+  RankingConfig,
+  Candidate,
+  ScoredCandidate,
+  AssembledContext,
+} from './scoring/ranking.js';
 
-export { EpisodicStore, SemanticStore, ProceduralStore, DecayEngine };
+export { EpisodicStore, SemanticStore, ProceduralStore, DecayEngine, RetrievalRanker };
 
 export type {
   Episode,
@@ -64,12 +75,19 @@ export type {
   DecayConfig,
   MemoryTrace,
   MemoryStoreKind,
+  RankingWeights,
+  RankingConfig,
+  Candidate,
+  ScoredCandidate,
+  AssembledContext,
 };
 
 /**
- * Defaults chosen so each store outlives the one below it: episodes fade in
- * days, facts in months, procedures in about a year. Treat these as a starting
- * point and tune them against your own retrieval evals.
+ * Defaults chosen so each store outlives the one below it: episodes fade in days,
+ * facts in months, procedures in about a year.
+ *
+ * The ordering is not cosmetic. DecayEngine rejects a semantic half-life shorter than
+ * the episodic one, because a fact must outlive the event that produced it.
  */
 export const DEFAULT_DECAY_PROFILE: DecayProfile = {
   episodic: { halfLifeDays: 3 },
@@ -80,8 +98,8 @@ export const DEFAULT_DECAY_PROFILE: DecayProfile = {
 
 export interface MemoryManagerConfig {
   /**
-   * Shared embedding function. Passed to all three stores so a single provider
-   * change does not require touching each one.
+   * Shared embedding function, passed to all three stores so a single provider change
+   * does not require touching each one.
    */
   embed?: (text: string) => Promise<number[]>;
   /** Used by episodic consolidation. Without it, episodes accumulate unsummarized. */
@@ -128,10 +146,10 @@ export class MemoryManager {
   /**
    * Query all three stores for a single goal.
    *
-   * Runs in parallel because the stores are independent: sequential fan-out
-   * would add the embedding round-trips together for no reason. If one store
-   * has no embedding function configured it degrades to its structural or
-   * success-rate ordering rather than failing the whole recall.
+   * Runs in parallel because the stores are independent: sequential fan-out would add
+   * the embedding round-trips together for no reason. If one store has no embedding
+   * function configured it degrades to its structural or success-rate ordering rather
+   * than failing the whole recall.
    */
   async recall(options: RecallOptions): Promise<RecallResult> {
     const {
@@ -168,9 +186,13 @@ export class MemoryManager {
   /**
    * Promote an episode into a durable fact.
    *
-   * This is the bridge between "the user told me X once" and "X is true".
-   * Kept explicit rather than automatic: silently inferring facts from single
-   * events is how agents end up confidently repeating noise.
+   * This is the bridge between "the user told me X once" and "X is true". Kept
+   * explicit rather than automatic: silently inferring facts from single events is how
+   * agents end up confidently repeating noise.
+   *
+   * Contradictions are RETURNED rather than resolved. Silently overwriting is how an
+   * agent becomes confidently wrong, and a disagreement between sources is information
+   * the caller usually wants to act on.
    */
   async promoteToFact(
     episodeId: string,
@@ -181,11 +203,19 @@ export class MemoryManager {
       throw new RangeError(`confidence must be within [0,1], got ${confidence}`);
     }
 
-    return this.semantic.add({
+    const result = await this.semantic.add({
       ...triple,
       confidence,
       source: { type: 'observation', episodeId },
     });
+
+    // The source episode is reinforced, because an episode that justified a durable
+    // fact has demonstrated its value and should not decay at the same rate as one
+    // that was never used again. Previously this method validated its input and then
+    // ignored the decay engine entirely.
+    this.episodic.touch?.(episodeId);
+
+    return result;
   }
 
   /** Aggregate counters from every store. Useful for dashboards and evals. */
@@ -201,3 +231,19 @@ export class MemoryManager {
     };
   }
 }
+
+/**
+ * Weight presets for the retrieval ranker.
+ *
+ * Exported as named presets because the correct balance is task-dependent, and a
+ * single default silently produces the wrong answer for half of all queries.
+ */
+export const RANKING_PRESETS = {
+  /** "What did we decide last week?" Strength is zero on purpose: a frequently
+   *  reinforced old memory is strong but not recent, and including it would pull
+   *  exactly the wrong results into a recency query. */
+  recencyFocused: RetrievalRanker.recencyFocused,
+  /** "What database does the user use?" Favours relevance and stability. */
+  stabilityFocused: RetrievalRanker.stabilityFocused,
+  balanced: RetrievalRanker.balanced,
+} as const;
